@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <limits>
 #include <shared_mutex>
+#include <stdexcept>
 
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/protocol.hpp"
@@ -41,7 +42,12 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
     : config(cfg), ctx(ctx) {
   application::RdmaDeviceList devices = ctx->GetRdmaDeviceList();
   availDevices = GetActiveDevicePortList(devices);
-  assert(availDevices.size() > 0);
+  if (availDevices.empty()) {
+    delete ctx;
+    this->ctx = nullptr;
+    throw std::runtime_error(
+        "No active RDMA device ports found (no NIC or no cable connected)");
+  }
 
   deviceCtxs.resize(availDevices.size(), nullptr);
   topo.reset(new application::TopoSystem());
