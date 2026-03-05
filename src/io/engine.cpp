@@ -127,10 +127,15 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
 
       backends.insert({type, std::move(backend)});
       InvalidateRouteCache();
+      MORI_IO_INFO("RDMA backend created and active");   // ← ADD HERE (inside try, after insert)
     } catch (const std::exception& e) {
       MORI_IO_WARN("RDMA backend creation failed: {}, will attempt xGMI fallback", e.what());
     }
     EnsureXgmiBackendCreatedIfSupported();
+    if (backends.count(BackendType::XGMI)) {             // ← ADD THIS BLOCK
+      MORI_IO_INFO("xGMI backend created and active (RDMA {})",
+                   backends.count(BackendType::RDMA) ? "also active" : "not available");
+    }
     if (backends.empty()) {
       MORI_IO_ERROR("No backends available: RDMA failed and xGMI not supported");
     }
@@ -142,7 +147,6 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   } else {
     assert(false && "not implemented");
   }
-  MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
 }
 
 bool IOEngine::SupportsXgmiBackendByP2P() const {
