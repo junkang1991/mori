@@ -483,8 +483,9 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
 
   std::unique_lock<std::shared_mutex> wlock(ipcMutex);
   remoteIpcHandles[desc.id] = {hsaHandle, remappedAddr, desc.size};
-  MORI_IO_TRACE("XGMI: Attached HSA IPC memory for id={}, remapped={}", desc.id,
-                reinterpret_cast<uintptr_t>(remappedAddr));
+  MORI_IO_INFO("XGMI: Attached HSA IPC memory for id={} (localDev={}, remoteDev={}), remapped={}",
+               desc.id, localDeviceId, desc.deviceId,
+               reinterpret_cast<uintptr_t>(remappedAddr));
   return remappedAddr;
 }
 
