@@ -135,12 +135,12 @@ class XgmiBackend : public Backend {
   std::vector<std::vector<bool>> p2pMatrix;
 
   struct IpcHandleEntry {
-    hipIpcMemHandle_t handle;
+    hsa_amd_ipc_memory_t hsaHandle{};
     void* remappedAddr{nullptr};
     size_t size{0};
   };
   mutable std::shared_mutex ipcMutex;
-  std::unordered_map<MemoryUniqueId, hipIpcMemHandle_t> localIpcHandles;
+  std::unordered_map<MemoryUniqueId, hsa_amd_ipc_memory_t> localIpcHandles;
   std::unordered_map<MemoryUniqueId, IpcHandleEntry> remoteIpcHandles;
 
   std::unordered_map<SessionCacheKey, std::unique_ptr<XgmiBackendSession>, SessionCacheKeyHash>
