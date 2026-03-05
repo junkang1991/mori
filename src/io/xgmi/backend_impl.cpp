@@ -30,6 +30,22 @@
 
 #include "mori/io/logging.hpp"
 
+// Helper: enumerate all local GPU agents visible to this process via HSA
+static std::vector<hsa_agent_t> GetLocalHsaGpuAgents() {
+  std::vector<hsa_agent_t> agents;
+  auto cb = [](hsa_agent_t agent, void* data) -> hsa_status_t {
+    auto* vec = reinterpret_cast<std::vector<hsa_agent_t>*>(data);
+    hsa_device_type_t type;
+    hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &type);
+    if (type == HSA_DEVICE_TYPE_GPU) {
+      vec->push_back(agent);
+    }
+    return HSA_STATUS_SUCCESS;
+  };
+  hsa_iterate_agents(cb, &agents);
+  return agents;
+}
+
 namespace mori {
 namespace io {
 namespace {
@@ -307,10 +323,11 @@ XgmiBackend::~XgmiBackend() {
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   for (auto& entry : remoteIpcHandles) {
     if (entry.second.remappedAddr != nullptr) {
-      hipError_t closeErr = hipIpcCloseMemHandle(entry.second.remappedAddr);
-      if (closeErr != hipSuccess) {
-        MORI_IO_WARN("XGMI: Failed to close IPC mem handle: {}", hipGetErrorString(closeErr));
-      }
+      hsa_status_t detachErr = hsa_amd_ipc_memory_detach(entry.second.remappedAddr);
+      if (detachErr != HSA_STATUS_SUCCESS) {
+        MORI_IO_WARN("XGMI: Failed to detach HSA IPC memory: hsa_status={}",
+                     static_cast<int>(detachErr));
+      }      
     }
   }
   remoteIpcHandles.clear();
@@ -397,19 +414,22 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
     return;
   }
 
-  hipIpcMemHandle_t handle;
-  hipError_t err = hipIpcGetMemHandle(&handle, reinterpret_cast<void*>(desc.data));
-  if (err != hipSuccess) {
-    MORI_IO_WARN("XGMI: Failed to get IPC handle for memory id={}: {}", desc.id,
-                 hipGetErrorString(err));
+  hsa_amd_ipc_memory_t hsaHandle;
+  hsa_status_t hsaErr =
+      hsa_amd_ipc_memory_create(reinterpret_cast<void*>(desc.data), desc.size, &hsaHandle);
+  if (hsaErr != HSA_STATUS_SUCCESS) {
+    MORI_IO_WARN("XGMI: Failed to create HSA IPC handle for memory id={}: hsa_status={}", desc.id,
+                 static_cast<int>(hsaErr));
     return;
   }
 
-  static_assert(sizeof(handle) == kIpcHandleSize, "IPC handle size mismatch");
-  std::memcpy(desc.ipcHandle.data(), &handle, sizeof(handle));
+  static_assert(sizeof(hsaHandle) <= kIpcHandleSize,
+                "HSA IPC handle size exceeds ipcHandle buffer");
+  std::memset(desc.ipcHandle.data(), 0, kIpcHandleSize);
+  std::memcpy(desc.ipcHandle.data(), &hsaHandle, sizeof(hsaHandle));
 
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
-  localIpcHandles[desc.id] = handle;
+  localIpcHandles[desc.id] = hsaHandle;
   MORI_IO_TRACE("XGMI: Registered memory id={}, addr={}, size={}", desc.id, desc.data, desc.size);
 }
 
@@ -433,36 +453,37 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
     }
   }
 
-  hipIpcMemHandle_t handle;
-  static_assert(sizeof(handle) == kIpcHandleSize, "IPC handle size mismatch");
-  std::memcpy(&handle, desc.ipcHandle.data(), sizeof(handle));
+  hsa_amd_ipc_memory_t hsaHandle;
+  static_assert(sizeof(hsaHandle) <= kIpcHandleSize,
+                "HSA IPC handle size exceeds ipcHandle buffer");
+  std::memcpy(&hsaHandle, desc.ipcHandle.data(), sizeof(hsaHandle));
 
-  ScopedHipDeviceGuard deviceGuard;
-  hipError_t err = hipSetDevice(localDeviceId);
-  if (err != hipSuccess) {
-    MORI_IO_WARN("XGMI: Failed to set device {} for IPC open: {}", localDeviceId,
-                 hipGetErrorString(err));
+  // Enumerate local GPU agents so the attached memory is accessible from them.
+  // hsa_amd_ipc_memory_attach operates at the KFD kernel level and works across
+  // CUDA_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES process isolation boundaries,
+  // allowing xGMI transfers from GPUs not visible to this process.
+  std::vector<hsa_agent_t> localAgents = GetLocalHsaGpuAgents();
+  if (localAgents.empty()) {
+    MORI_IO_WARN("XGMI: No local HSA GPU agents found for IPC attach, id={}", desc.id);
     return nullptr;
   }
 
   void* remappedAddr = nullptr;
-  err = hipIpcOpenMemHandle(&remappedAddr, handle, hipIpcMemLazyEnablePeerAccess);
-  if (err != hipSuccess) {
-    hipError_t clearErr = hipGetLastError();
-    if (clearErr != hipSuccess) {
-      MORI_IO_WARN("XGMI: Failed to clear IPC open error: {}", hipGetErrorString(clearErr));
-    }
-    if (IsP2PAccessible(localDeviceId, desc.deviceId)) {
-      MORI_IO_TRACE("XGMI: IPC failed, using direct P2P pointer for id={}", desc.id);
-      return reinterpret_cast<void*>(desc.data);
-    }
-    MORI_IO_WARN("XGMI: Failed to open IPC handle for id={}: {}", desc.id, hipGetErrorString(err));
+  hsa_status_t hsaErr =
+      hsa_amd_ipc_memory_attach(&hsaHandle, desc.size,
+                                static_cast<uint32_t>(localAgents.size()), localAgents.data(),
+                                &remappedAddr);
+  if (hsaErr != HSA_STATUS_SUCCESS) {
+    MORI_IO_WARN(
+        "XGMI: Failed to attach HSA IPC memory for id={} (localDev={}, remoteDev={}): "
+        "hsa_status={}",
+        desc.id, localDeviceId, desc.deviceId, static_cast<int>(hsaErr));
     return nullptr;
   }
 
   std::unique_lock<std::shared_mutex> wlock(ipcMutex);
-  remoteIpcHandles[desc.id] = {handle, remappedAddr, desc.size};
-  MORI_IO_TRACE("XGMI: Opened IPC handle for id={}, remapped={}", desc.id,
+  remoteIpcHandles[desc.id] = {hsaHandle, remappedAddr, desc.size};
+  MORI_IO_TRACE("XGMI: Attached HSA IPC memory for id={}, remapped={}", desc.id,
                 reinterpret_cast<uintptr_t>(remappedAddr));
   return remappedAddr;
 }
