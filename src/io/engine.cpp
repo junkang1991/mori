@@ -107,26 +107,33 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   }
 
   if (type == BackendType::RDMA) {
-    auto backend = std::make_unique<RdmaBackend>(desc.key, config,
-                                                 static_cast<const RdmaBackendConfig&>(beConfig));
+    try {
+      auto backend = std::make_unique<RdmaBackend>(
+          desc.key, config, static_cast<const RdmaBackendConfig&>(beConfig));
 
-    if (config.port == 0) {
-      auto bound_port_opt = backend->GetListenPort();
-      if (!bound_port_opt.has_value() || bound_port_opt.value() == 0) {
-        MORI_IO_ERROR("IOEngine key {} failed to retrieve bound port after RDMA backend init",
-                      desc.key);
-        assert(false && "Failed to retrieve bound port after RDMA backend init");
-      } else {
-        uint16_t bound_port = bound_port_opt.value();
-        desc.port = bound_port;
-        this->config.port = bound_port;
-        MORI_IO_INFO("IOEngine key {} bound ephemeral port {}", desc.key, bound_port);
+      if (config.port == 0) {
+        auto bound_port_opt = backend->GetListenPort();
+        if (!bound_port_opt.has_value() || bound_port_opt.value() == 0) {
+          MORI_IO_ERROR("IOEngine key {} failed to retrieve bound port after RDMA backend init",
+                        desc.key);
+          assert(false && "Failed to retrieve bound port after RDMA backend init");
+        } else {
+          uint16_t bound_port = bound_port_opt.value();
+          desc.port = bound_port;
+          this->config.port = bound_port;
+          MORI_IO_INFO("IOEngine key {} bound ephemeral port {}", desc.key, bound_port);
+        }
       }
-    }
 
-    backends.insert({type, std::move(backend)});
-    InvalidateRouteCache();
+      backends.insert({type, std::move(backend)});
+      InvalidateRouteCache();
+    } catch (const std::exception& e) {
+      MORI_IO_WARN("RDMA backend creation failed: {}, will attempt xGMI fallback", e.what());
+    }
     EnsureXgmiBackendCreatedIfSupported();
+    if (backends.empty()) {
+      MORI_IO_ERROR("No backends available: RDMA failed and xGMI not supported");
+    }
   } else if (type == BackendType::XGMI) {
     auto backend = std::make_unique<XgmiBackend>(desc.key, config,
                                                  static_cast<const XgmiBackendConfig&>(beConfig));
